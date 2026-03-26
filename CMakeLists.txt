@@ -5,6 +5,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(torso_interfaces REQUIRED)
 
 add_executable(torso_node src/torso_node.cpp)
 
@@ -12,6 +13,7 @@ ament_target_dependencies(torso_node
   rclcpp
   std_msgs
   sensor_msgs
+  torso_interfaces
 )
 
 install(TARGETS
