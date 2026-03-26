@@ -34,19 +34,27 @@ public:
     if (tcgetattr(fd_, &options) != 0)
       return false;
 
+    options.c_iflag &= ~(INLCR | ICRNL | IXON | IXOFF);
+    options.c_iflag |= IGNPAR;
     options.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
     options.c_oflag &= ~(ONLCR | OCRNL);
+    options.c_cc[VMIN]  = 0;
+    options.c_cc[VTIME] = 10;
 
-    options.c_cc[VMIN] = 0;
-    options.c_cc[VTIME] = 1;
+    if (tcsetattr(fd_, TCSANOW, &options) != 0)
+      return false;
 
-    return tcsetattr(fd_, TCSANOW, &options) == 0;
+    tcflush(fd_, TCIOFLUSH);
+    return true;
   }
 
   void close_port()
   {
     if (fd_ >= 0)
+    {
       close(fd_);
+      fd_ = -1;
+    }
   }
 
   int read_feedback()
@@ -54,9 +62,9 @@ public:
     return read_variable_2b(0xA5);
   }
 
-  int read_errors()
+  int read_and_clear_errors()
   {
-    return read_signed_2b(0xB3);
+    return read_variable_2b(0xB3);
   }
 
   bool set_target(int target)
@@ -76,7 +84,7 @@ private:
   bool write_bytes(const uint8_t *data, size_t size)
   {
     ssize_t written = write(fd_, data, size);
-    return (written == (ssize_t)size);
+    return (written == static_cast<ssize_t>(size));
   }
 
   int read_variable_2b(uint8_t cmd)
@@ -86,21 +94,13 @@ private:
     if (!write_bytes(&cmd, 1))
       return -1;
 
-    uint8_t resp[2];
+    uint8_t resp[2] = {0, 0};
     ssize_t n = read(fd_, resp, 2);
+
     if (n != 2)
       return -1;
 
     return resp[0] + 256 * resp[1];
-  }
-
-  int read_signed_2b(uint8_t cmd)
-  {
-    int val = read_variable_2b(cmd);
-    if (val < 0)
-      return val;
-
-    return static_cast<int16_t>(val);
   }
 };
 
@@ -125,7 +125,7 @@ public:
     initialize_messages();
 
     timer_ = this->create_wall_timer(
-        std::chrono::milliseconds((int)(1000.0 / publish_rate_hz_)),
+        std::chrono::milliseconds(static_cast<int>(1000.0 / publish_rate_hz_)),
         std::bind(&TorsoNode::timer_callback, this));
 
     RCLCPP_INFO(this->get_logger(), "Torso node ready");
@@ -167,8 +167,8 @@ private:
   // STATE
   // =========================
   double current_position_m_ = 0.0;
-  double goal_position_m_ = 0.0;
-  int current_feedback_ = 0;
+  double goal_position_m_    = 0.0;
+  int    current_feedback_   = 0;
 
   // =========================
   // HARDWARE
@@ -178,47 +178,41 @@ private:
   // =========================
   // MESSAGES
   // =========================
-  sensor_msgs::msg::JointState joint_msg_;
-  std_msgs::msg::Float64MultiArray current_pose_msg_;
+  sensor_msgs::msg::JointState      joint_msg_;
+  std_msgs::msg::Float64MultiArray  current_pose_msg_;
 
   // ======================================================
   // PARAMETERS
   // ======================================================
   bool declare_and_get_parameters()
   {
-    this->declare_parameter("simulation", false);
-    this->declare_parameter("port", "/dev/torso");
-
-    this->declare_parameter("joint_states_topic", "joint_states");
-    this->declare_parameter("current_pose_topic", "current_pose");
+    this->declare_parameter("simulation",               false);
+    this->declare_parameter("port",                     "/dev/torso");
+    this->declare_parameter("joint_states_topic",       "joint_states");
+    this->declare_parameter("current_pose_topic",       "current_pose");
     this->declare_parameter("torso_controller_service", "move_torso");
+    this->declare_parameter("joint_name",               "torso_joint");
+    this->declare_parameter("min_position_m",           0.0);
+    this->declare_parameter("max_position_m",           0.30);
+    this->declare_parameter("feedback_min",             0);
+    this->declare_parameter("feedback_max",             4095);
+    this->declare_parameter("target_min",               0);
+    this->declare_parameter("target_max",               4095);
+    this->declare_parameter("publish_rate",             30.0);
 
-    this->declare_parameter("joint_name", "torso_joint");
-
-    this->declare_parameter("min_position_m", 0.0);
-    this->declare_parameter("max_position_m", 0.30);
-    this->declare_parameter("feedback_min", 0);
-    this->declare_parameter("feedback_max", 4095);
-    this->declare_parameter("target_min", 0);
-    this->declare_parameter("target_max", 4095);
-    this->declare_parameter("publish_rate", 30.0);
-
-    simulation_ = this->get_parameter("simulation").as_bool();
-    port_ = this->get_parameter("port").as_string();
-
-    joint_states_topic_ = this->get_parameter("joint_states_topic").as_string();
-    current_pose_topic_ = this->get_parameter("current_pose_topic").as_string();
+    simulation_               = this->get_parameter("simulation").as_bool();
+    port_                     = this->get_parameter("port").as_string();
+    joint_states_topic_       = this->get_parameter("joint_states_topic").as_string();
+    current_pose_topic_       = this->get_parameter("current_pose_topic").as_string();
     torso_controller_service_ = this->get_parameter("torso_controller_service").as_string();
-
-    joint_name_ = this->get_parameter("joint_name").as_string();
-
-    min_m_ = this->get_parameter("min_position_m").as_double();
-    max_m_ = this->get_parameter("max_position_m").as_double();
-    fb_min_ = this->get_parameter("feedback_min").as_int();
-    fb_max_ = this->get_parameter("feedback_max").as_int();
-    target_min_ = this->get_parameter("target_min").as_int();
-    target_max_ = this->get_parameter("target_max").as_int();
-    publish_rate_hz_ = this->get_parameter("publish_rate").as_double();
+    joint_name_               = this->get_parameter("joint_name").as_string();
+    min_m_                    = this->get_parameter("min_position_m").as_double();
+    max_m_                    = this->get_parameter("max_position_m").as_double();
+    fb_min_                   = this->get_parameter("feedback_min").as_int();
+    fb_max_                   = this->get_parameter("feedback_max").as_int();
+    target_min_               = this->get_parameter("target_min").as_int();
+    target_max_               = this->get_parameter("target_max").as_int();
+    publish_rate_hz_          = this->get_parameter("publish_rate").as_double();
 
     return true;
   }
@@ -232,7 +226,7 @@ private:
     {
       RCLCPP_WARN(this->get_logger(), "Running in SIMULATION mode");
       current_position_m_ = min_m_;
-      goal_position_m_ = min_m_;
+      goal_position_m_    = min_m_;
       return true;
     }
 
@@ -245,9 +239,19 @@ private:
     int fb = jrk_.read_feedback();
     if (fb >= 0)
     {
-      current_feedback_ = fb;
+      current_feedback_   = fb;
       current_position_m_ = feedback_to_meters(fb);
-      goal_position_m_ = current_position_m_;
+      goal_position_m_    = current_position_m_;
+
+      int initial_target = meters_to_target(current_position_m_);
+      jrk_.set_target(initial_target);
+      RCLCPP_INFO(this->get_logger(),
+                  "Initial target set to %d (%.3f m)", initial_target, current_position_m_);
+    }
+    else
+    {
+      RCLCPP_ERROR(this->get_logger(), "Failed to read initial feedback from Jrk");
+      return false;
     }
 
     return true;
@@ -258,12 +262,15 @@ private:
   // ======================================================
   void setup_interfaces()
   {
-    pub_joint_ = this->create_publisher<sensor_msgs::msg::JointState>(joint_states_topic_, 10);
-    pub_current_pose_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(current_pose_topic_, 10);
+    pub_joint_ = this->create_publisher<sensor_msgs::msg::JointState>(
+        joint_states_topic_, 10);
+    pub_current_pose_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
+        current_pose_topic_, 10);
 
     srv_move_ = this->create_service<torso_interfaces::srv::MoveTorso>(
         torso_controller_service_,
-        std::bind(&TorsoNode::move_service, this, std::placeholders::_1, std::placeholders::_2));
+        std::bind(&TorsoNode::move_service, this,
+                  std::placeholders::_1, std::placeholders::_2));
   }
 
   void initialize_messages()
@@ -286,9 +293,13 @@ private:
     double desired = std::clamp(req->position, min_m_, max_m_);
     goal_position_m_ = desired;
 
+    int target = meters_to_target(desired);
+
+    RCLCPP_INFO(this->get_logger(),
+                "Sending target: %d (%.3f m)", target, desired);
+
     if (!simulation_)
     {
-      int target = meters_to_target(desired);
       if (!jrk_.set_target(target))
       {
         res->success = false;
@@ -315,7 +326,7 @@ private:
       int fb = jrk_.read_feedback();
       if (fb >= 0)
       {
-        current_feedback_ = fb;
+        current_feedback_   = fb;
         current_position_m_ = feedback_to_meters(fb);
       }
     }
@@ -330,11 +341,10 @@ private:
   {
     auto now = this->now();
 
-    joint_msg_.header.stamp = now;
-    joint_msg_.position[0] = current_position_m_;
-    joint_msg_.velocity[0] = 0.0;
-    joint_msg_.effort[0] = 0.0;
-
+    joint_msg_.header.stamp  = now;
+    joint_msg_.position[0]   = current_position_m_;
+    joint_msg_.velocity[0]   = 0.0;
+    joint_msg_.effort[0]     = 0.0;
     pub_joint_->publish(joint_msg_);
 
     current_pose_msg_.data[0] = current_position_m_;
@@ -344,7 +354,7 @@ private:
   double feedback_to_meters(int fb)
   {
     fb = std::clamp(fb, fb_min_, fb_max_);
-    double alpha = (double)(fb - fb_min_) / (fb_max_ - fb_min_);
+    double alpha = static_cast<double>(fb - fb_min_) / (fb_max_ - fb_min_);
     return min_m_ + alpha * (max_m_ - min_m_);
   }
 
@@ -353,7 +363,7 @@ private:
     m = std::clamp(m, min_m_, max_m_);
     double alpha = (m - min_m_) / (max_m_ - min_m_);
     return std::clamp(
-        (int)std::lround(target_min_ + alpha * (target_max_ - target_min_)),
+        static_cast<int>(std::lround(target_min_ + alpha * (target_max_ - target_min_))),
         target_min_, target_max_);
   }
 };
