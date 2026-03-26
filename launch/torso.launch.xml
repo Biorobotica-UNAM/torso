@@ -1,16 +1,15 @@
 <launch>
 
-  <!-- Argumentos configurables -->
-  <arg name="port" default="/dev/torso"/>
-  <arg name="baudrate" default="9600"/>
+  <arg name="use_sim_time" default="false"/>
 
-  <node
-    pkg="torso"
-    exec="torso_node"
-    name="torso_node"
-    output="screen">
+  <group>
+    <push-ros-namespace namespace="torso"/>
 
-    <param name="port" value="$(var port)"/>
-  </node>
+    <node pkg="torso" exec="torso_node" name="torso_node" output="screen">
+      <param from="$(find-pkg-share torso)/config/torso.yaml"/>
+      <param name="use_sim_time" value="$(var use_sim_time)"/>
+    </node>
+
+  </group>
 
 </launch>

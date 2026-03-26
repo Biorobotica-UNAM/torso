@@ -3,8 +3,8 @@
 <package format="3">
   <name>torso</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="frankoangel6112@gmail.com">franco</maintainer>
+  <description>Torso controller using JRK</description>
+  <maintainer email="marco.soriano5102@comunidad.unam.mx">Marco Soriano</maintainer>
   <license>TODO: License declaration</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
