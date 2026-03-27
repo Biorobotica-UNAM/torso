@@ -5,6 +5,7 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
+#include <thread>
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
@@ -26,23 +27,35 @@ class JrkInterface
 public:
   bool open_port(const std::string &device)
   {
-    fd_ = open(device.c_str(), O_RDWR | O_NOCTTY);
+    fd_ = open(device.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
     if (fd_ < 0)
       return false;
 
     struct termios options{};
     if (tcgetattr(fd_, &options) != 0)
+    {
+      close_port();
       return false;
+    }
 
-    options.c_iflag &= ~(INLCR | ICRNL | IXON | IXOFF);
-    options.c_iflag |= IGNPAR;
-    options.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
-    options.c_oflag &= ~(ONLCR | OCRNL);
+    cfmakeraw(&options);
+    cfsetispeed(&options, B9600);
+    cfsetospeed(&options, B9600);
+
+    options.c_cflag |= (CLOCAL | CREAD);
+    options.c_cflag &= ~PARENB;
+    options.c_cflag &= ~CSTOPB;
+    options.c_cflag &= ~CSIZE;
+    options.c_cflag |= CS8;
+
     options.c_cc[VMIN]  = 0;
-    options.c_cc[VTIME] = 10;
+    options.c_cc[VTIME] = 10;  // 1.0 s
 
     if (tcsetattr(fd_, TCSANOW, &options) != 0)
+    {
+      close_port();
       return false;
+    }
 
     tcflush(fd_, TCIOFLUSH);
     return true;
@@ -62,7 +75,7 @@ public:
     return read_variable_2b(0xA5);
   }
 
-  int read_and_clear_errors()
+  int read_errors_active()
   {
     return read_variable_2b(0xB3);
   }
@@ -221,41 +234,73 @@ private:
   // INIT HARDWARE
   // ======================================================
   bool initialize_hardware()
+{
+  if (simulation_)
   {
-    if (simulation_)
-    {
-      RCLCPP_WARN(this->get_logger(), "Running in SIMULATION mode");
-      current_position_m_ = min_m_;
-      goal_position_m_    = min_m_;
-      return true;
-    }
-
-    if (!jrk_.open_port(port_))
-    {
-      RCLCPP_ERROR(this->get_logger(), "Failed to open port: %s", port_.c_str());
-      return false;
-    }
-
-    int fb = jrk_.read_feedback();
-    if (fb >= 0)
-    {
-      current_feedback_   = fb;
-      current_position_m_ = feedback_to_meters(fb);
-      goal_position_m_    = current_position_m_;
-
-      int initial_target = meters_to_target(current_position_m_);
-      jrk_.set_target(initial_target);
-      RCLCPP_INFO(this->get_logger(),
-                  "Initial target set to %d (%.3f m)", initial_target, current_position_m_);
-    }
-    else
-    {
-      RCLCPP_ERROR(this->get_logger(), "Failed to read initial feedback from Jrk");
-      return false;
-    }
-
+    RCLCPP_WARN(this->get_logger(), "Running in SIMULATION mode");
+    current_position_m_ = min_m_;
+    goal_position_m_    = min_m_;
     return true;
   }
+
+  if (!jrk_.open_port(port_))
+  {
+    RCLCPP_ERROR(this->get_logger(), "Failed to open port: %s", port_.c_str());
+    return false;
+  }
+
+  // === 1) Leer feedback inicial ===
+  int fb_before = jrk_.read_feedback();
+  if (fb_before < 0)
+  {
+    RCLCPP_ERROR(this->get_logger(), "Failed to read initial feedback from Jrk");
+    return false;
+  }
+
+  RCLCPP_INFO(this->get_logger(), "Feedback inicial: %d", fb_before);
+
+  // === 2) Leer errores activos (0xB3) ===
+  int err = jrk_.read_errors_active();
+  if (err >= 0)
+  {
+    RCLCPP_INFO(this->get_logger(), "Errores activos: 0x%04X (%d)", err, err);
+  }
+  else
+  {
+    RCLCPP_WARN(this->get_logger(), "No se pudo leer errores activos");
+  }
+
+  // === 3) Mandar target 2048 (centro) ===
+  constexpr int startup_target = 2048;
+  if (!jrk_.set_target(startup_target))
+  {
+    RCLCPP_ERROR(this->get_logger(), "Failed to send startup target: %d", startup_target);
+    return false;
+  }
+
+  RCLCPP_INFO(this->get_logger(), "Target enviado: %d", startup_target);
+
+  // === 4) Esperar un poco ===
+  std::this_thread::sleep_for(500ms);
+
+  // === 5) Leer feedback post-comando ===
+  int fb_after = jrk_.read_feedback();
+  if (fb_after < 0)
+  {
+    RCLCPP_WARN(this->get_logger(),
+                "Failed to read feedback post-comando, usando feedback inicial");
+    fb_after = fb_before;
+  }
+
+  RCLCPP_INFO(this->get_logger(), "Feedback post-comando: %d", fb_after);
+
+  // === 6) Actualizar estado interno ===
+  current_feedback_   = fb_after;
+  current_position_m_ = feedback_to_meters(fb_after);
+  goal_position_m_    = current_position_m_;
+
+  return true;
+}
 
   // ======================================================
   // ROS INTERFACES
