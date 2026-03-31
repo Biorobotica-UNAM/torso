@@ -96,6 +96,9 @@ private:
 
   bool write_bytes(const uint8_t *data, size_t size)
   {
+    if (fd_ < 0)
+      return false;
+
     ssize_t written = write(fd_, data, size);
     return (written == static_cast<ssize_t>(size));
   }
@@ -167,6 +170,10 @@ private:
   std::string torso_controller_service_;
   std::string joint_name_;
 
+  double move_timeout_s_ = 20.0;
+  int feedback_tolerance_ = 500;
+  int stable_reads_required_ = 3;
+
   double min_m_;
   double max_m_;
   int fb_min_;
@@ -182,6 +189,7 @@ private:
   double current_position_m_ = 0.0;
   double goal_position_m_    = 0.0;
   int    current_feedback_   = 0;
+  bool   motion_in_progress_ = false;
 
   // =========================
   // HARDWARE
@@ -206,12 +214,15 @@ private:
     this->declare_parameter("torso_controller_service", "move_torso");
     this->declare_parameter("joint_name",               "torso_joint");
     this->declare_parameter("min_position_m",           0.0);
-    this->declare_parameter("max_position_m",           0.30);
+    this->declare_parameter("max_position_m",           0.3014);
     this->declare_parameter("feedback_min",             0);
     this->declare_parameter("feedback_max",             4095);
     this->declare_parameter("target_min",               0);
     this->declare_parameter("target_max",               4095);
     this->declare_parameter("publish_rate",             30.0);
+    this->declare_parameter("move_timeout_s",           8.0);
+    this->declare_parameter("feedback_tolerance",       20);
+    this->declare_parameter("stable_reads_required",    3);
 
     simulation_               = this->get_parameter("simulation").as_bool();
     port_                     = this->get_parameter("port").as_string();
@@ -227,6 +238,34 @@ private:
     target_max_               = this->get_parameter("target_max").as_int();
     publish_rate_hz_          = this->get_parameter("publish_rate").as_double();
 
+    move_timeout_s_           = this->get_parameter("move_timeout_s").as_double();
+    feedback_tolerance_       = this->get_parameter("feedback_tolerance").as_int();
+    stable_reads_required_    = this->get_parameter("stable_reads_required").as_int();
+
+    if (max_m_ <= min_m_)
+    {
+      RCLCPP_ERROR(this->get_logger(),
+                   "Invalid position range: min_position_m=%.6f max_position_m=%.6f",
+                   min_m_, max_m_);
+      return false;
+    }
+
+    if (fb_max_ <= fb_min_)
+    {
+      RCLCPP_ERROR(this->get_logger(),
+                   "Invalid feedback range: feedback_min=%d feedback_max=%d",
+                   fb_min_, fb_max_);
+      return false;
+    }
+
+    if (target_max_ <= target_min_)
+    {
+      RCLCPP_ERROR(this->get_logger(),
+                   "Invalid target range: target_min=%d target_max=%d",
+                   target_min_, target_max_);
+      return false;
+    }
+
     return true;
   }
 
@@ -234,73 +273,64 @@ private:
   // INIT HARDWARE
   // ======================================================
   bool initialize_hardware()
-{
-  if (simulation_)
   {
-    RCLCPP_WARN(this->get_logger(), "Running in SIMULATION mode");
-    current_position_m_ = min_m_;
-    goal_position_m_    = min_m_;
+    if (simulation_)
+    {
+      RCLCPP_WARN(this->get_logger(), "Running in SIMULATION mode");
+      current_feedback_   = fb_min_;
+      current_position_m_ = min_m_;
+      goal_position_m_    = min_m_;
+      return true;
+    }
+
+    if (!jrk_.open_port(port_))
+    {
+      RCLCPP_ERROR(this->get_logger(), "Failed to open port: %s", port_.c_str());
+      return false;
+    }
+
+    int fb_before = jrk_.read_feedback();
+    if (fb_before < 0)
+    {
+      RCLCPP_ERROR(this->get_logger(), "Failed to read initial feedback from Jrk");
+      return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Feedback inicial: %d", fb_before);
+
+    int err = jrk_.read_errors_active();
+    if (err >= 0)
+      RCLCPP_INFO(this->get_logger(), "Errores activos: 0x%04X (%d)", err, err);
+    else
+      RCLCPP_WARN(this->get_logger(), "No se pudo leer errores activos");
+
+    const int startup_target = (target_min_ + target_max_) / 2;
+    if (!jrk_.set_target(startup_target))
+    {
+      RCLCPP_ERROR(this->get_logger(), "Failed to send startup target: %d", startup_target);
+      return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Target enviado: %d", startup_target);
+
+    std::this_thread::sleep_for(500ms);
+
+    int fb_after = jrk_.read_feedback();
+    if (fb_after < 0)
+    {
+      RCLCPP_WARN(this->get_logger(),
+                  "Failed to read feedback post-comando, usando feedback inicial");
+      fb_after = fb_before;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Feedback post-comando: %d", fb_after);
+
+    current_feedback_   = fb_after;
+    current_position_m_ = feedback_to_meters(fb_after);
+    goal_position_m_    = current_position_m_;
+
     return true;
   }
-
-  if (!jrk_.open_port(port_))
-  {
-    RCLCPP_ERROR(this->get_logger(), "Failed to open port: %s", port_.c_str());
-    return false;
-  }
-
-  // === 1) Leer feedback inicial ===
-  int fb_before = jrk_.read_feedback();
-  if (fb_before < 0)
-  {
-    RCLCPP_ERROR(this->get_logger(), "Failed to read initial feedback from Jrk");
-    return false;
-  }
-
-  RCLCPP_INFO(this->get_logger(), "Feedback inicial: %d", fb_before);
-
-  // === 2) Leer errores activos (0xB3) ===
-  int err = jrk_.read_errors_active();
-  if (err >= 0)
-  {
-    RCLCPP_INFO(this->get_logger(), "Errores activos: 0x%04X (%d)", err, err);
-  }
-  else
-  {
-    RCLCPP_WARN(this->get_logger(), "No se pudo leer errores activos");
-  }
-
-  // === 3) Mandar target 2048 (centro) ===
-  constexpr int startup_target = 2048;
-  if (!jrk_.set_target(startup_target))
-  {
-    RCLCPP_ERROR(this->get_logger(), "Failed to send startup target: %d", startup_target);
-    return false;
-  }
-
-  RCLCPP_INFO(this->get_logger(), "Target enviado: %d", startup_target);
-
-  // === 4) Esperar un poco ===
-  std::this_thread::sleep_for(500ms);
-
-  // === 5) Leer feedback post-comando ===
-  int fb_after = jrk_.read_feedback();
-  if (fb_after < 0)
-  {
-    RCLCPP_WARN(this->get_logger(),
-                "Failed to read feedback post-comando, usando feedback inicial");
-    fb_after = fb_before;
-  }
-
-  RCLCPP_INFO(this->get_logger(), "Feedback post-comando: %d", fb_after);
-
-  // === 6) Actualizar estado interno ===
-  current_feedback_   = fb_after;
-  current_position_m_ = feedback_to_meters(fb_after);
-  goal_position_m_    = current_position_m_;
-
-  return true;
-}
 
   // ======================================================
   // ROS INTERFACES
@@ -309,6 +339,7 @@ private:
   {
     pub_joint_ = this->create_publisher<sensor_msgs::msg::JointState>(
         joint_states_topic_, 10);
+
     pub_current_pose_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
         current_pose_topic_, 10);
 
@@ -338,23 +369,47 @@ private:
     double desired = std::clamp(req->position, min_m_, max_m_);
     goal_position_m_ = desired;
 
-    int target = meters_to_target(desired);
+    int target      = meters_to_target(desired);
+    int expected_fb = meters_to_feedback(desired);
 
     RCLCPP_INFO(this->get_logger(),
-                "Sending target: %d (%.3f m)", target, desired);
+                "Requested=%.6f m | Clamped=%.6f m | Target=%d | ExpectedFb=%d",
+                req->position, desired, target, expected_fb);
 
-    if (!simulation_)
+    if (simulation_)
     {
-      if (!jrk_.set_target(target))
-      {
-        res->success = false;
-        res->message = "Failed to send target";
-        return;
-      }
+      current_feedback_   = expected_fb;
+      current_position_m_ = desired;
+      publish();
+
+      res->success = true;
+      res->message = "Movement completed (simulation)";
+      return;
     }
 
-    res->success = true;
-    res->message = "Command sent";
+    motion_in_progress_ = true;
+
+    if (!jrk_.set_target(target))
+    {
+      motion_in_progress_ = false;
+      res->success = false;
+      res->message = "Failed to send target";
+      return;
+    }
+
+    bool reached = wait_until_reached_feedback(expected_fb);
+    motion_in_progress_ = false;
+
+    if (reached)
+    {
+      res->success = true;
+      res->message = "Movement completed";
+    }
+    else
+    {
+      res->success = false;
+      res->message = "Target sent, but feedback did not reach expected position";
+    }
   }
 
   // ======================================================
@@ -362,9 +417,13 @@ private:
   // ======================================================
   void timer_callback()
   {
+    if (motion_in_progress_)
+      return;
+
     if (simulation_)
     {
       current_position_m_ = goal_position_m_;
+      current_feedback_   = meters_to_feedback(current_position_m_);
     }
     else
     {
@@ -386,10 +445,10 @@ private:
   {
     auto now = this->now();
 
-    joint_msg_.header.stamp  = now;
-    joint_msg_.position[0]   = current_position_m_;
-    joint_msg_.velocity[0]   = 0.0;
-    joint_msg_.effort[0]     = 0.0;
+    joint_msg_.header.stamp = now;
+    joint_msg_.position[0]  = current_position_m_;
+    joint_msg_.velocity[0]  = 0.0;
+    joint_msg_.effort[0]    = 0.0;
     pub_joint_->publish(joint_msg_);
 
     current_pose_msg_.data[0] = current_position_m_;
@@ -399,17 +458,100 @@ private:
   double feedback_to_meters(int fb)
   {
     fb = std::clamp(fb, fb_min_, fb_max_);
-    double alpha = static_cast<double>(fb - fb_min_) / (fb_max_ - fb_min_);
+    double alpha = static_cast<double>(fb - fb_min_) /
+                   static_cast<double>(fb_max_ - fb_min_);
     return min_m_ + alpha * (max_m_ - min_m_);
   }
 
   int meters_to_target(double m)
   {
+    constexpr double eps = 1e-6;
+
     m = std::clamp(m, min_m_, max_m_);
+
+    if (m <= min_m_ + eps)
+      return target_min_;
+
+    if (m >= max_m_ - eps)
+      return target_max_;
+
     double alpha = (m - min_m_) / (max_m_ - min_m_);
+
     return std::clamp(
         static_cast<int>(std::lround(target_min_ + alpha * (target_max_ - target_min_))),
         target_min_, target_max_);
+  }
+
+  int meters_to_feedback(double m)
+  {
+    constexpr double eps = 1e-6;
+
+    m = std::clamp(m, min_m_, max_m_);
+
+    if (m <= min_m_ + eps)
+      return fb_min_;
+
+    if (m >= max_m_ - eps)
+      return fb_max_;
+
+    double alpha = (m - min_m_) / (max_m_ - min_m_);
+
+    return std::clamp(
+        static_cast<int>(std::lround(fb_min_ + alpha * (fb_max_ - fb_min_))),
+        fb_min_, fb_max_);
+  }
+
+  bool wait_until_reached_feedback(int expected_fb)
+  {
+    if (simulation_)
+    {
+      current_feedback_   = expected_fb;
+      current_position_m_ = feedback_to_meters(expected_fb);
+      publish();
+      return true;
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    int stable_reads = 0;
+
+    while (rclcpp::ok())
+    {
+      int fb = jrk_.read_feedback();
+      if (fb >= 0)
+      {
+        current_feedback_   = fb;
+        current_position_m_ = feedback_to_meters(fb);
+        publish();
+
+        int error = std::abs(fb - expected_fb);
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(), *this->get_clock(), 500,
+            "Esperando movimiento... expected_fb=%d fb=%d error=%d",
+            expected_fb, fb, error);
+
+        if (error <= feedback_tolerance_)
+        {
+          stable_reads++;
+          if (stable_reads >= stable_reads_required_)
+            return true;
+        }
+        else
+        {
+          stable_reads = 0;
+        }
+      }
+
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start).count();
+
+      if (elapsed > static_cast<long>(move_timeout_s_ * 1000.0))
+        return false;
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    return false;
   }
 };
 

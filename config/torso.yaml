@@ -14,6 +14,7 @@
 
     feedback_min: 0
     feedback_max: 4095
+    feedback_tolerance: 450
 
     target_min: 0
     target_max: 4095
