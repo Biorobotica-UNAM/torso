@@ -1,6 +1,6 @@
 /**:
   ros__parameters:
-    simulation: false
+    simulation: true
     port: "/dev/torso"
 
     joint_states_topic: "joint_states"
