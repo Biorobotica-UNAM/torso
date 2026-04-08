@@ -1,156 +1,567 @@
-#include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/float32.hpp>
-
-#include <fcntl.h>
-#include <unistd.h>
-#include <termios.h>
-#include <cstring>
-#include <stdexcept>
+#include <algorithm>
+#include <memory>
 #include <chrono>
+#include <cmath>
+#include <cstring>
+#include <mutex>
+#include <vector>
 #include <thread>
 
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
+#include "std_msgs/msg/float64_multi_array.hpp"
+#include "torso_interfaces/srv/move_torso.hpp"
+
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
+#include <errno.h>
+
+using namespace std::chrono_literals;
+
+// ======================================================
+// JRK INTERFACE
+// ======================================================
+class JrkInterface
+{
+public:
+  bool open_port(const std::string &device)
+  {
+    fd_ = open(device.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
+    if (fd_ < 0)
+      return false;
+
+    struct termios options{};
+    if (tcgetattr(fd_, &options) != 0)
+    {
+      close_port();
+      return false;
+    }
+
+    cfmakeraw(&options);
+    cfsetispeed(&options, B9600);
+    cfsetospeed(&options, B9600);
+
+    options.c_cflag |= (CLOCAL | CREAD);
+    options.c_cflag &= ~PARENB;
+    options.c_cflag &= ~CSTOPB;
+    options.c_cflag &= ~CSIZE;
+    options.c_cflag |= CS8;
+
+    options.c_cc[VMIN]  = 0;
+    options.c_cc[VTIME] = 10;  // 1.0 s
+
+    if (tcsetattr(fd_, TCSANOW, &options) != 0)
+    {
+      close_port();
+      return false;
+    }
+
+    tcflush(fd_, TCIOFLUSH);
+    return true;
+  }
+
+  void close_port()
+  {
+    if (fd_ >= 0)
+    {
+      close(fd_);
+      fd_ = -1;
+    }
+  }
+
+  int read_feedback()
+  {
+    return read_variable_2b(0xA5);
+  }
+
+  int read_errors_active()
+  {
+    return read_variable_2b(0xB3);
+  }
+
+  bool set_target(int target)
+  {
+    const uint8_t bytes[2] = {
+        static_cast<uint8_t>(0xC0 + (target & 0x1F)),
+        static_cast<uint8_t>((target >> 5) & 0x7F)};
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    return write_bytes(bytes, 2);
+  }
+
+private:
+  int fd_ = -1;
+  std::mutex mutex_;
+
+  bool write_bytes(const uint8_t *data, size_t size)
+  {
+    if (fd_ < 0)
+      return false;
+
+    ssize_t written = write(fd_, data, size);
+    return (written == static_cast<ssize_t>(size));
+  }
+
+  int read_variable_2b(uint8_t cmd)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (!write_bytes(&cmd, 1))
+      return -1;
+
+    uint8_t resp[2] = {0, 0};
+    ssize_t n = read(fd_, resp, 2);
+
+    if (n != 2)
+      return -1;
+
+    return resp[0] + 256 * resp[1];
+  }
+};
+
+// ======================================================
+// TORSO NODE
+// ======================================================
 class TorsoNode : public rclcpp::Node
 {
 public:
-    TorsoNode() : Node("torso_node")
+  TorsoNode() : Node("torso_node")
+  {
+    RCLCPP_INFO(this->get_logger(), "Initializing torso_node...");
+
+    if (!declare_and_get_parameters() || !initialize_hardware())
     {
-        declare_parameter("port", "/dev/jrk_torso");
-        declare_parameter("baudrate", 9600);
-        declare_parameter<std::string>("goal_topic", "/hardware/torso/goal");
-
-        std::string port;
-        int baudrate;
-        std::string goal_topic;
-
-        get_parameter("port", port);
-        get_parameter("baudrate", baudrate);
-        get_parameter("goal_topic", goal_topic);
-
-        fd_ = open(port.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
-        if (fd_ < 0)
-        {
-            RCLCPP_FATAL(get_logger(), "No se pudo abrir el puerto %s", port.c_str());
-            throw std::runtime_error("Serial open failed");
-        }
-
-        configureSerial(baudrate);
-
-        // Pequeña espera por si el dispositivo lo necesita
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-        // Clear errors 0xB3
-        if (!sendInitByte())
-        {
-            throw std::runtime_error("Init byte failed");
-        }
-
-        RCLCPP_INFO(get_logger(), "Get Error Flags Halting 0xB3 enviado correctamente");
-
-        sub_ = create_subscription<std_msgs::msg::Float32>(
-            goal_topic,
-            10,
-            std::bind(&TorsoNode::targetCallback, this, std::placeholders::_1)
-        );
-
-        RCLCPP_INFO(get_logger(), "Torso node listo y escuchando /jrk_target");
+      RCLCPP_ERROR(this->get_logger(), "Initialization failed");
+      rclcpp::shutdown();
+      return;
     }
 
-    ~TorsoNode()
-    {
-        if (fd_ >= 0)
-            close(fd_);
-    }
+    setup_interfaces();
+    initialize_messages();
+
+    timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(static_cast<int>(1000.0 / publish_rate_hz_)),
+        std::bind(&TorsoNode::timer_callback, this));
+
+    RCLCPP_INFO(this->get_logger(), "Torso node ready");
+  }
+
+  ~TorsoNode()
+  {
+    jrk_.close_port();
+  }
 
 private:
-    int fd_;
-    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_;
+  // =========================
+  // ROS
+  // =========================
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_joint_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_current_pose_;
+  rclcpp::Service<torso_interfaces::srv::MoveTorso>::SharedPtr srv_move_;
+  rclcpp::TimerBase::SharedPtr timer_;
 
-    void configureSerial(int baudrate)
+  // =========================
+  // PARAMETERS
+  // =========================
+  std::string port_;
+  std::string joint_states_topic_;
+  std::string current_pose_topic_;
+  std::string torso_controller_service_;
+  std::string joint_name_;
+
+  double move_timeout_s_ = 20.0;
+  int feedback_tolerance_ = 500;
+  int stable_reads_required_ = 3;
+
+  double min_m_;
+  double max_m_;
+  int fb_min_;
+  int fb_max_;
+  int target_min_;
+  int target_max_;
+  double publish_rate_hz_;
+  bool simulation_;
+
+  // =========================
+  // STATE
+  // =========================
+  double current_position_m_ = 0.0;
+  double goal_position_m_    = 0.0;
+  int    current_feedback_   = 0;
+  bool   motion_in_progress_ = false;
+
+  // =========================
+  // HARDWARE
+  // =========================
+  JrkInterface jrk_;
+
+  // =========================
+  // MESSAGES
+  // =========================
+  sensor_msgs::msg::JointState      joint_msg_;
+  std_msgs::msg::Float64MultiArray  current_pose_msg_;
+
+  // ======================================================
+  // PARAMETERS
+  // ======================================================
+  bool declare_and_get_parameters()
+  {
+    this->declare_parameter("simulation",               false);
+    this->declare_parameter("port",                     "/dev/torso");
+    this->declare_parameter("joint_states_topic",       "joint_states");
+    this->declare_parameter("current_pose_topic",       "current_pose");
+    this->declare_parameter("torso_controller_service", "move_torso");
+    this->declare_parameter("joint_name",               "torso_joint");
+    this->declare_parameter("min_position_m",           0.0);
+    this->declare_parameter("max_position_m",           0.3014);
+    this->declare_parameter("feedback_min",             0);
+    this->declare_parameter("feedback_max",             4095);
+    this->declare_parameter("target_min",               0);
+    this->declare_parameter("target_max",               4095);
+    this->declare_parameter("publish_rate",             30.0);
+    this->declare_parameter("move_timeout_s",           8.0);
+    this->declare_parameter("feedback_tolerance",       20);
+    this->declare_parameter("stable_reads_required",    3);
+
+    simulation_               = this->get_parameter("simulation").as_bool();
+    port_                     = this->get_parameter("port").as_string();
+    joint_states_topic_       = this->get_parameter("joint_states_topic").as_string();
+    current_pose_topic_       = this->get_parameter("current_pose_topic").as_string();
+    torso_controller_service_ = this->get_parameter("torso_controller_service").as_string();
+    joint_name_               = this->get_parameter("joint_name").as_string();
+    min_m_                    = this->get_parameter("min_position_m").as_double();
+    max_m_                    = this->get_parameter("max_position_m").as_double();
+    fb_min_                   = this->get_parameter("feedback_min").as_int();
+    fb_max_                   = this->get_parameter("feedback_max").as_int();
+    target_min_               = this->get_parameter("target_min").as_int();
+    target_max_               = this->get_parameter("target_max").as_int();
+    publish_rate_hz_          = this->get_parameter("publish_rate").as_double();
+
+    move_timeout_s_           = this->get_parameter("move_timeout_s").as_double();
+    feedback_tolerance_       = this->get_parameter("feedback_tolerance").as_int();
+    stable_reads_required_    = this->get_parameter("stable_reads_required").as_int();
+
+    if (max_m_ <= min_m_)
     {
-        struct termios tty{};
-        if (tcgetattr(fd_, &tty) != 0)
-        {
-            throw std::runtime_error("tcgetattr failed");
-        }
-
-        speed_t speed = B9600;
-        if (baudrate == 115200) speed = B115200;
-
-        cfsetospeed(&tty, speed);
-        cfsetispeed(&tty, speed);
-
-        tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
-        tty.c_cflag |= CLOCAL | CREAD;
-        tty.c_cflag &= ~(PARENB | CSTOPB | CRTSCTS);
-
-        tty.c_lflag = 0;
-        tty.c_iflag = 0;
-        tty.c_oflag = 0;
-
-        tty.c_cc[VMIN]  = 0;
-        tty.c_cc[VTIME] = 5;
-
-        if (tcsetattr(fd_, TCSANOW, &tty) != 0)
-        {
-            throw std::runtime_error("tcsetattr failed");
-        }
+      RCLCPP_ERROR(this->get_logger(),
+                   "Invalid position range: min_position_m=%.6f max_position_m=%.6f",
+                   min_m_, max_m_);
+      return false;
     }
 
-    bool sendInitByte()
+    if (fb_max_ <= fb_min_)
     {
-        unsigned char b = 0xB3;
+      RCLCPP_ERROR(this->get_logger(),
+                   "Invalid feedback range: feedback_min=%d feedback_max=%d",
+                   fb_min_, fb_max_);
+      return false;
+    }
 
-        ssize_t n = write(fd_, &b, 1);
-        if (n != 1)
+    if (target_max_ <= target_min_)
+    {
+      RCLCPP_ERROR(this->get_logger(),
+                   "Invalid target range: target_min=%d target_max=%d",
+                   target_min_, target_max_);
+      return false;
+    }
+
+    return true;
+  }
+
+  // ======================================================
+  // INIT HARDWARE
+  // ======================================================
+  bool initialize_hardware()
+  {
+    if (simulation_)
+    {
+      RCLCPP_WARN(this->get_logger(), "Running in SIMULATION mode");
+      current_feedback_   = fb_min_;
+      current_position_m_ = min_m_;
+      goal_position_m_    = min_m_;
+      return true;
+    }
+
+    if (!jrk_.open_port(port_))
+    {
+      RCLCPP_ERROR(this->get_logger(), "Failed to open port: %s", port_.c_str());
+      return false;
+    }
+
+    int fb_before = jrk_.read_feedback();
+    if (fb_before < 0)
+    {
+      RCLCPP_ERROR(this->get_logger(), "Failed to read initial feedback from Jrk");
+      return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Feedback inicial: %d", fb_before);
+
+    int err = jrk_.read_errors_active();
+    if (err >= 0)
+      RCLCPP_INFO(this->get_logger(), "Errores activos: 0x%04X (%d)", err, err);
+    else
+      RCLCPP_WARN(this->get_logger(), "No se pudo leer errores activos");
+
+    const int startup_target = (target_min_ + target_max_) / 2;
+    if (!jrk_.set_target(startup_target))
+    {
+      RCLCPP_ERROR(this->get_logger(), "Failed to send startup target: %d", startup_target);
+      return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Target enviado: %d", startup_target);
+
+    std::this_thread::sleep_for(500ms);
+
+    int fb_after = jrk_.read_feedback();
+    if (fb_after < 0)
+    {
+      RCLCPP_WARN(this->get_logger(),
+                  "Failed to read feedback post-comando, usando feedback inicial");
+      fb_after = fb_before;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Feedback post-comando: %d", fb_after);
+
+    current_feedback_   = fb_after;
+    current_position_m_ = feedback_to_meters(fb_after);
+    goal_position_m_    = current_position_m_;
+
+    return true;
+  }
+
+  // ======================================================
+  // ROS INTERFACES
+  // ======================================================
+  void setup_interfaces()
+  {
+    pub_joint_ = this->create_publisher<sensor_msgs::msg::JointState>(
+        joint_states_topic_, 10);
+
+    pub_current_pose_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
+        current_pose_topic_, 10);
+
+    srv_move_ = this->create_service<torso_interfaces::srv::MoveTorso>(
+        torso_controller_service_,
+        std::bind(&TorsoNode::move_service, this,
+                  std::placeholders::_1, std::placeholders::_2));
+  }
+
+  void initialize_messages()
+  {
+    joint_msg_.name = {joint_name_};
+    joint_msg_.position.resize(1);
+    joint_msg_.velocity.resize(1);
+    joint_msg_.effort.resize(1);
+
+    current_pose_msg_.data.resize(1);
+  }
+
+  // ======================================================
+  // SERVICE
+  // ======================================================
+  void move_service(
+      const std::shared_ptr<torso_interfaces::srv::MoveTorso::Request> req,
+      std::shared_ptr<torso_interfaces::srv::MoveTorso::Response> res)
+  {
+    double desired = std::clamp(req->position, min_m_, max_m_);
+    goal_position_m_ = desired;
+
+    int target      = meters_to_target(desired);
+    int expected_fb = meters_to_feedback(desired);
+
+    RCLCPP_INFO(this->get_logger(),
+                "Requested=%.6f m | Clamped=%.6f m | Target=%d | ExpectedFb=%d",
+                req->position, desired, target, expected_fb);
+
+    if (simulation_)
+    {
+      current_feedback_   = expected_fb;
+      current_position_m_ = desired;
+      publish();
+
+      res->success = true;
+      res->message = "Movement completed (simulation)";
+      return;
+    }
+
+    motion_in_progress_ = true;
+
+    if (!jrk_.set_target(target))
+    {
+      motion_in_progress_ = false;
+      res->success = false;
+      res->message = "Failed to send target";
+      return;
+    }
+
+    bool reached = wait_until_reached_feedback(expected_fb);
+    motion_in_progress_ = false;
+
+    if (reached)
+    {
+      res->success = true;
+      res->message = "Movement completed";
+    }
+    else
+    {
+      res->success = false;
+      res->message = "Target sent, but feedback did not reach expected position";
+    }
+  }
+
+  // ======================================================
+  // TIMER
+  // ======================================================
+  void timer_callback()
+  {
+    if (motion_in_progress_)
+      return;
+
+    if (simulation_)
+    {
+      current_position_m_ = goal_position_m_;
+      current_feedback_   = meters_to_feedback(current_position_m_);
+    }
+    else
+    {
+      int fb = jrk_.read_feedback();
+      if (fb >= 0)
+      {
+        current_feedback_   = fb;
+        current_position_m_ = feedback_to_meters(fb);
+      }
+    }
+
+    publish();
+  }
+
+  // ======================================================
+  // HELPERS
+  // ======================================================
+  void publish()
+  {
+    auto now = this->now();
+
+    joint_msg_.header.stamp = now;
+    joint_msg_.position[0]  = current_position_m_;
+    joint_msg_.velocity[0]  = 0.0;
+    joint_msg_.effort[0]    = 0.0;
+    pub_joint_->publish(joint_msg_);
+
+    current_pose_msg_.data[0] = current_position_m_;
+    pub_current_pose_->publish(current_pose_msg_);
+  }
+
+  double feedback_to_meters(int fb)
+  {
+    fb = std::clamp(fb, fb_min_, fb_max_);
+    double alpha = static_cast<double>(fb - fb_min_) /
+                   static_cast<double>(fb_max_ - fb_min_);
+    return min_m_ + alpha * (max_m_ - min_m_);
+  }
+
+  int meters_to_target(double m)
+  {
+    constexpr double eps = 1e-6;
+
+    m = std::clamp(m, min_m_, max_m_);
+
+    if (m <= min_m_ + eps)
+      return target_min_;
+
+    if (m >= max_m_ - eps)
+      return target_max_;
+
+    double alpha = (m - min_m_) / (max_m_ - min_m_);
+
+    return std::clamp(
+        static_cast<int>(std::lround(target_min_ + alpha * (target_max_ - target_min_))),
+        target_min_, target_max_);
+  }
+
+  int meters_to_feedback(double m)
+  {
+    constexpr double eps = 1e-6;
+
+    m = std::clamp(m, min_m_, max_m_);
+
+    if (m <= min_m_ + eps)
+      return fb_min_;
+
+    if (m >= max_m_ - eps)
+      return fb_max_;
+
+    double alpha = (m - min_m_) / (max_m_ - min_m_);
+
+    return std::clamp(
+        static_cast<int>(std::lround(fb_min_ + alpha * (fb_max_ - fb_min_))),
+        fb_min_, fb_max_);
+  }
+
+  bool wait_until_reached_feedback(int expected_fb)
+  {
+    if (simulation_)
+    {
+      current_feedback_   = expected_fb;
+      current_position_m_ = feedback_to_meters(expected_fb);
+      publish();
+      return true;
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    int stable_reads = 0;
+
+    while (rclcpp::ok())
+    {
+      int fb = jrk_.read_feedback();
+      if (fb >= 0)
+      {
+        current_feedback_   = fb;
+        current_position_m_ = feedback_to_meters(fb);
+        publish();
+
+        int error = std::abs(fb - expected_fb);
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(), *this->get_clock(), 500,
+            "Esperando movimiento... expected_fb=%d fb=%d error=%d",
+            expected_fb, fb, error);
+
+        if (error <= feedback_tolerance_)
         {
-            RCLCPP_ERROR(get_logger(), "Error enviando byte 0xB3");
-            return false;
+          stable_reads++;
+          if (stable_reads >= stable_reads_required_)
+            return true;
         }
-
-        tcdrain(fd_);  // asegurar envío
-        return true;
-    }
-
-    int jrkSetTarget(float target)
-    {
-        int target_bits = (int)(target * 15996.09375f + 0.5f);
-
-        if (target_bits > 4095) target_bits = 4095;
-        if (target_bits < 0)    target_bits = 0;
-
-        unsigned char command[] = {
-            static_cast<unsigned char>(0xC0 + (target_bits & 0x1F)),
-            static_cast<unsigned char>((target_bits >> 5) & 0x7F)
-        };
-
-        if (write(fd_, command, sizeof(command)) != (ssize_t)sizeof(command))
+        else
         {
-            RCLCPP_ERROR(get_logger(), "Error enviando target");
-            return -1;
+          stable_reads = 0;
         }
+      }
 
-        return 0;
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start).count();
+
+      if (elapsed > static_cast<long>(move_timeout_s_ * 1000.0))
+        return false;
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    void targetCallback(const std_msgs::msg::Float32::SharedPtr msg)
-    {
-        jrkSetTarget(msg->data);
-    }
+    return false;
+  }
 };
 
-int main(int argc, char *argv[])
+// ======================================================
+// MAIN
+// ======================================================
+int main(int argc, char **argv)
 {
-    rclcpp::init(argc, argv);
-
-    try
-    {
-        rclcpp::spin(std::make_shared<TorsoNode>());
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << "Error fatal: " << e.what() << std::endl;
-    }
-
-    rclcpp::shutdown();
-    return 0;
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<TorsoNode>());
+  rclcpp::shutdown();
+  return 0;
 }
