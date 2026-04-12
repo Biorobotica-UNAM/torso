@@ -188,6 +188,7 @@ private:
 
   double min_m_;
   double max_m_;
+  double startup_position_m_;
   int fb_min_;
   int fb_max_;
   int target_min_;
@@ -234,6 +235,7 @@ private:
     this->declare_parameter("joint_name",               "torso_joint");
     this->declare_parameter("min_position_m",           0.0);
     this->declare_parameter("max_position_m",           0.3014);
+    this->declare_parameter("startup_position_m",       0.0);
     this->declare_parameter("feedback_min",             0);
     this->declare_parameter("feedback_max",             4095);
     this->declare_parameter("target_min",               0);
@@ -253,6 +255,7 @@ private:
     joint_name_               = this->get_parameter("joint_name").as_string();
     min_m_                    = this->get_parameter("min_position_m").as_double();
     max_m_                    = this->get_parameter("max_position_m").as_double();
+    startup_position_m_       = this->get_parameter("startup_position_m").as_double();
     fb_min_                   = this->get_parameter("feedback_min").as_int();
     fb_max_                   = this->get_parameter("feedback_max").as_int();
     target_min_               = this->get_parameter("target_min").as_int();
@@ -309,14 +312,14 @@ private:
       return false;
     }
 
-    int fb_before = jrk_.read_feedback();
-    if (fb_before < 0)
+    int fb = jrk_.read_feedback();
+    if (fb < 0)
     {
       RCLCPP_ERROR(this->get_logger(), "Failed to read initial feedback from Jrk");
       return false;
     }
 
-    RCLCPP_INFO(this->get_logger(), "Feedback inicial: %d", fb_before);
+    RCLCPP_INFO(this->get_logger(), "Feedback inicial: %d", fb);
 
     int err = jrk_.read_errors_active();
     if (err >= 0)
@@ -324,30 +327,34 @@ private:
     else
       RCLCPP_WARN(this->get_logger(), "No se pudo leer errores activos");
 
-    const int startup_target = (target_min_ + target_max_) / 2;
+    current_feedback_   = fb;
+    current_position_m_ = feedback_to_meters(fb);
+    goal_position_m_    = current_position_m_;
+
+    // Move to startup position
+    double startup = std::clamp(startup_position_m_, min_m_, max_m_);
+    int startup_target = meters_to_target(startup);
+
+    RCLCPP_INFO(this->get_logger(),
+                "Moving to startup position: %.4f m (target=%d)",
+                startup, startup_target);
+
     if (!jrk_.set_target(startup_target))
     {
-      RCLCPP_ERROR(this->get_logger(), "Failed to send startup target: %d", startup_target);
-      return false;
+      RCLCPP_WARN(this->get_logger(), "Failed to send startup target");
+      return true;  // Non-fatal: continue without startup move
     }
 
-    RCLCPP_INFO(this->get_logger(), "Target enviado: %d", startup_target);
+    bool reached = wait_until_reached_feedback(meters_to_feedback(startup));
 
-    std::this_thread::sleep_for(500ms);
-
-    int fb_after = jrk_.read_feedback();
-    if (fb_after < 0)
-    {
+    if (reached)
+      RCLCPP_INFO(this->get_logger(),
+                  "Startup position reached: %.4f m", current_position_m_);
+    else
       RCLCPP_WARN(this->get_logger(),
-                  "Failed to read feedback post-comando, usando feedback inicial");
-      fb_after = fb_before;
-    }
+                  "Startup position not fully reached. Current: %.4f m", current_position_m_);
 
-    RCLCPP_INFO(this->get_logger(), "Feedback post-comando: %d", fb_after);
-
-    current_feedback_   = fb_after;
-    current_position_m_ = feedback_to_meters(fb_after);
-    goal_position_m_    = current_position_m_;
+    goal_position_m_ = current_position_m_;
 
     return true;
   }
