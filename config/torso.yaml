@@ -1,10 +1,12 @@
 /**:
   ros__parameters:
-    simulation: true
+    simulation: false
     port: "/dev/torso"
 
     joint_states_topic: "joint_states"
     current_pose_topic: "current_pose"
+    goal_pose_topic: "goal_pose"
+    goal_reached_topic: "goal_reached"
     torso_controller_service: "move_torso"
 
     joint_name: "torso_joint"
@@ -12,11 +14,13 @@
     min_position_m: 0.0
     max_position_m: 0.3014
 
-    feedback_min: 0
-    feedback_max: 4095
-    feedback_tolerance: 450
+    feedback_min: 80
+    feedback_max: 3600
+    feedback_tolerance: 20
+    stable_reads_required: 3
 
     target_min: 0
     target_max: 4095
 
     publish_rate: 30.0
+    move_timeout_s: 10.0
