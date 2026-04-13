@@ -143,7 +143,6 @@ public:
     setup_interfaces();
     initialize_messages();
 
-    // Move to startup position (top of range)
     RCLCPP_INFO(this->get_logger(), "Moving to starting position...");
     std::string msg;
     if (move_to_position(max_m_, msg))
@@ -240,7 +239,7 @@ private:
     this->declare_parameter("goal_reached_topic",       "goal_reached");
     this->declare_parameter("joint_name",               "torso_joint");
     this->declare_parameter("min_position_m",           0.0);
-    this->declare_parameter("max_position_m",           0.3014);
+    this->declare_parameter("max_position_m",           0.3);
     this->declare_parameter("feedback_min",             0);
     this->declare_parameter("feedback_max",             4095);
     this->declare_parameter("target_min",               0);
@@ -373,7 +372,7 @@ private:
   }
 
   // ======================================================
-  // MOVEMENT CONTROL (shared by service, topic, and startup)
+  // MOVEMENT CONTROL
   // ======================================================
   bool move_to_position(double desired, std::string &message)
   {
