@@ -22,5 +22,5 @@
     target_min: 0
     target_max: 4095
 
-    publish_rate: 30.0
+    publish_rate: 10.0
     move_timeout_s: 10.0
