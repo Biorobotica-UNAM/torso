@@ -145,7 +145,7 @@ public:
 
     RCLCPP_INFO(this->get_logger(), "Moving to starting position...");
     std::string msg;
-    if (move_to_position(max_m_, msg))
+    if (move_to_position(min_m_, msg))
       RCLCPP_INFO(this->get_logger(), "Starting position reached");
     else
       RCLCPP_WARN(this->get_logger(), "Failed to reach starting position: %s", msg.c_str());
