@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <atomic>
+#include <future>
 #include <memory>
 #include <chrono>
 #include <cmath>
@@ -9,6 +11,7 @@
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
 #include "torso_interfaces/srv/move_torso.hpp"
 
@@ -140,6 +143,13 @@ public:
     setup_interfaces();
     initialize_messages();
 
+    RCLCPP_INFO(this->get_logger(), "Moving to starting position...");
+    std::string msg;
+    if (move_to_position(min_m_, msg))
+      RCLCPP_INFO(this->get_logger(), "Starting position reached");
+    else
+      RCLCPP_WARN(this->get_logger(), "Failed to reach starting position: %s", msg.c_str());
+
     timer_ = this->create_wall_timer(
         std::chrono::milliseconds(static_cast<int>(1000.0 / publish_rate_hz_)),
         std::bind(&TorsoNode::timer_callback, this));
@@ -149,6 +159,10 @@ public:
 
   ~TorsoNode()
   {
+    motion_cancelled_.store(true);
+    if (motion_future_.valid())
+      motion_future_.wait();
+
     jrk_.close_port();
   }
 
@@ -158,7 +172,9 @@ private:
   // =========================
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_joint_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_current_pose_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_goal_reached_;
   rclcpp::Service<torso_interfaces::srv::MoveTorso>::SharedPtr srv_move_;
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_goal_pose_;
   rclcpp::TimerBase::SharedPtr timer_;
 
   // =========================
@@ -168,20 +184,22 @@ private:
   std::string joint_states_topic_;
   std::string current_pose_topic_;
   std::string torso_controller_service_;
+  std::string goal_pose_topic_;
+  std::string goal_reached_topic_;
   std::string joint_name_;
 
-  double move_timeout_s_ = 20.0;
-  int feedback_tolerance_ = 500;
-  int stable_reads_required_ = 3;
+  double move_timeout_s_        = 20.0;
+  int    feedback_tolerance_    = 500;
+  int    stable_reads_required_ = 3;
 
   double min_m_;
   double max_m_;
-  int fb_min_;
-  int fb_max_;
-  int target_min_;
-  int target_max_;
+  int    fb_min_;
+  int    fb_max_;
+  int    target_min_;
+  int    target_max_;
   double publish_rate_hz_;
-  bool simulation_;
+  bool   simulation_;
 
   // =========================
   // STATE
@@ -189,7 +207,12 @@ private:
   double current_position_m_ = 0.0;
   double goal_position_m_    = 0.0;
   int    current_feedback_   = 0;
-  bool   motion_in_progress_ = false;
+  std::atomic<bool> motion_in_progress_{false};
+
+  // Motion concurrency control
+  std::atomic<bool> motion_active_{false};
+  std::atomic<bool> motion_cancelled_{false};
+  std::future<void> motion_future_;
 
   // =========================
   // HARDWARE
@@ -199,8 +222,8 @@ private:
   // =========================
   // MESSAGES
   // =========================
-  sensor_msgs::msg::JointState      joint_msg_;
-  std_msgs::msg::Float64MultiArray  current_pose_msg_;
+  sensor_msgs::msg::JointState     joint_msg_;
+  std_msgs::msg::Float64MultiArray current_pose_msg_;
 
   // ======================================================
   // PARAMETERS
@@ -212,9 +235,11 @@ private:
     this->declare_parameter("joint_states_topic",       "joint_states");
     this->declare_parameter("current_pose_topic",       "current_pose");
     this->declare_parameter("torso_controller_service", "move_torso");
+    this->declare_parameter("goal_pose_topic",          "goal_pose");
+    this->declare_parameter("goal_reached_topic",       "goal_reached");
     this->declare_parameter("joint_name",               "torso_joint");
     this->declare_parameter("min_position_m",           0.0);
-    this->declare_parameter("max_position_m",           0.3014);
+    this->declare_parameter("max_position_m",           0.3);
     this->declare_parameter("feedback_min",             0);
     this->declare_parameter("feedback_max",             4095);
     this->declare_parameter("target_min",               0);
@@ -229,6 +254,8 @@ private:
     joint_states_topic_       = this->get_parameter("joint_states_topic").as_string();
     current_pose_topic_       = this->get_parameter("current_pose_topic").as_string();
     torso_controller_service_ = this->get_parameter("torso_controller_service").as_string();
+    goal_pose_topic_          = this->get_parameter("goal_pose_topic").as_string();
+    goal_reached_topic_       = this->get_parameter("goal_reached_topic").as_string();
     joint_name_               = this->get_parameter("joint_name").as_string();
     min_m_                    = this->get_parameter("min_position_m").as_double();
     max_m_                    = this->get_parameter("max_position_m").as_double();
@@ -237,7 +264,6 @@ private:
     target_min_               = this->get_parameter("target_min").as_int();
     target_max_               = this->get_parameter("target_max").as_int();
     publish_rate_hz_          = this->get_parameter("publish_rate").as_double();
-
     move_timeout_s_           = this->get_parameter("move_timeout_s").as_double();
     feedback_tolerance_       = this->get_parameter("feedback_tolerance").as_int();
     stable_reads_required_    = this->get_parameter("stable_reads_required").as_int();
@@ -304,29 +330,8 @@ private:
     else
       RCLCPP_WARN(this->get_logger(), "No se pudo leer errores activos");
 
-    const int startup_target = (target_min_ + target_max_) / 2;
-    if (!jrk_.set_target(startup_target))
-    {
-      RCLCPP_ERROR(this->get_logger(), "Failed to send startup target: %d", startup_target);
-      return false;
-    }
-
-    RCLCPP_INFO(this->get_logger(), "Target enviado: %d", startup_target);
-
-    std::this_thread::sleep_for(500ms);
-
-    int fb_after = jrk_.read_feedback();
-    if (fb_after < 0)
-    {
-      RCLCPP_WARN(this->get_logger(),
-                  "Failed to read feedback post-comando, usando feedback inicial");
-      fb_after = fb_before;
-    }
-
-    RCLCPP_INFO(this->get_logger(), "Feedback post-comando: %d", fb_after);
-
-    current_feedback_   = fb_after;
-    current_position_m_ = feedback_to_meters(fb_after);
+    current_feedback_   = fb_before;
+    current_position_m_ = feedback_to_meters(fb_before);
     goal_position_m_    = current_position_m_;
 
     return true;
@@ -343,10 +348,17 @@ private:
     pub_current_pose_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
         current_pose_topic_, 10);
 
+    pub_goal_reached_ = this->create_publisher<std_msgs::msg::Bool>(
+        goal_reached_topic_, 10);
+
     srv_move_ = this->create_service<torso_interfaces::srv::MoveTorso>(
         torso_controller_service_,
         std::bind(&TorsoNode::move_service, this,
                   std::placeholders::_1, std::placeholders::_2));
+
+    sub_goal_pose_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
+        goal_pose_topic_, 10,
+        std::bind(&TorsoNode::goal_pose_callback, this, std::placeholders::_1));
   }
 
   void initialize_messages()
@@ -360,13 +372,11 @@ private:
   }
 
   // ======================================================
-  // SERVICE
+  // MOVEMENT CONTROL
   // ======================================================
-  void move_service(
-      const std::shared_ptr<torso_interfaces::srv::MoveTorso::Request> req,
-      std::shared_ptr<torso_interfaces::srv::MoveTorso::Response> res)
+  bool move_to_position(double desired, std::string &message)
   {
-    double desired = std::clamp(req->position, min_m_, max_m_);
+    desired          = std::clamp(desired, min_m_, max_m_);
     goal_position_m_ = desired;
 
     int target      = meters_to_target(desired);
@@ -374,42 +384,78 @@ private:
 
     RCLCPP_INFO(this->get_logger(),
                 "Requested=%.6f m | Clamped=%.6f m | Target=%d | ExpectedFb=%d",
-                req->position, desired, target, expected_fb);
+                desired, desired, target, expected_fb);
 
     if (simulation_)
     {
       current_feedback_   = expected_fb;
       current_position_m_ = desired;
-      publish();
-
-      res->success = true;
-      res->message = "Movement completed (simulation)";
-      return;
+      message = "Movement completed (simulation)";
+      return true;
     }
-
-    motion_in_progress_ = true;
 
     if (!jrk_.set_target(target))
     {
-      motion_in_progress_ = false;
-      res->success = false;
-      res->message = "Failed to send target";
-      return;
+      message = "Failed to send target";
+      return false;
     }
 
     bool reached = wait_until_reached_feedback(expected_fb);
-    motion_in_progress_ = false;
+    message = reached ? "Movement completed" : "Target sent, but feedback did not reach expected position";
+    return reached;
+  }
 
-    if (reached)
+  // ======================================================
+  // TOPIC CALLBACK (goal_pose)
+  // ======================================================
+  void goal_pose_callback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
+  {
+    if (msg->data.empty())
     {
-      res->success = true;
-      res->message = "Movement completed";
+      RCLCPP_WARN(this->get_logger(), "goal_pose received empty data, ignoring");
+      return;
     }
-    else
+
+    if (motion_active_.load())
     {
-      res->success = false;
-      res->message = "Target sent, but feedback did not reach expected position";
+      RCLCPP_WARN(this->get_logger(), "New goal_pose received while moving. Cancelling current motion.");
+      motion_cancelled_.store(true);
+      if (motion_future_.valid())
+        motion_future_.wait();
     }
+
+    double desired = msg->data[0];
+
+    motion_cancelled_.store(false);
+    motion_active_.store(true);
+    motion_in_progress_.store(true);
+
+    motion_future_ = std::async(std::launch::async, [this, desired]()
+    {
+      std::string result_msg;
+      bool reached = move_to_position(desired, result_msg);
+
+      RCLCPP_INFO(this->get_logger(), "goal_pose result: %s", result_msg.c_str());
+
+      std_msgs::msg::Bool out;
+      out.data = reached;
+      pub_goal_reached_->publish(out);
+
+      motion_in_progress_.store(false);
+      motion_active_.store(false);
+    });
+  }
+
+  // ======================================================
+  // SERVICE
+  // ======================================================
+  void move_service(
+      const std::shared_ptr<torso_interfaces::srv::MoveTorso::Request> req,
+      std::shared_ptr<torso_interfaces::srv::MoveTorso::Response> res)
+  {
+    motion_in_progress_.store(true);
+    res->success = move_to_position(req->position, res->message);
+    motion_in_progress_.store(false);
   }
 
   // ======================================================
@@ -417,7 +463,7 @@ private:
   // ======================================================
   void timer_callback()
   {
-    if (motion_in_progress_)
+    if (motion_in_progress_.load())
       return;
 
     if (simulation_)
@@ -469,11 +515,8 @@ private:
 
     m = std::clamp(m, min_m_, max_m_);
 
-    if (m <= min_m_ + eps)
-      return target_min_;
-
-    if (m >= max_m_ - eps)
-      return target_max_;
+    if (m <= min_m_ + eps) return target_min_;
+    if (m >= max_m_ - eps) return target_max_;
 
     double alpha = (m - min_m_) / (max_m_ - min_m_);
 
@@ -488,11 +531,8 @@ private:
 
     m = std::clamp(m, min_m_, max_m_);
 
-    if (m <= min_m_ + eps)
-      return fb_min_;
-
-    if (m >= max_m_ - eps)
-      return fb_max_;
+    if (m <= min_m_ + eps) return fb_min_;
+    if (m >= max_m_ - eps) return fb_max_;
 
     double alpha = (m - min_m_) / (max_m_ - min_m_);
 
@@ -507,14 +547,13 @@ private:
     {
       current_feedback_   = expected_fb;
       current_position_m_ = feedback_to_meters(expected_fb);
-      publish();
       return true;
     }
 
     auto start = std::chrono::steady_clock::now();
     int stable_reads = 0;
 
-    while (rclcpp::ok())
+    while (rclcpp::ok() && !motion_cancelled_.load())
     {
       int fb = jrk_.read_feedback();
       if (fb >= 0)
