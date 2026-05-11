@@ -16,7 +16,7 @@
 
     feedback_min: 80
     feedback_max: 3600
-    feedback_tolerance: 100
+    feedback_tolerance: 200
     stable_reads_required: 3
 
     target_min: 0
