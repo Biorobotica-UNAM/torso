@@ -15,6 +15,7 @@
 #include "std_msgs/msg/float64_multi_array.hpp"
 #include "torso_interfaces/srv/move_torso.hpp"
 
+#include <poll.h>
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -106,20 +107,26 @@ private:
     return (written == static_cast<ssize_t>(size));
   }
 
+  #include <poll.h>  // arriba en JrkInterface
+
   int read_variable_2b(uint8_t cmd)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+      std::lock_guard<std::mutex> lock(mutex_);
 
-    if (!write_bytes(&cmd, 1))
-      return -1;
+      if (!write_bytes(&cmd, 1)) return -1;
 
-    uint8_t resp[2] = {0, 0};
-    ssize_t n = read(fd_, resp, 2);
+      struct pollfd pfd{};
+      pfd.fd     = fd_;
+      pfd.events = POLLIN;
 
-    if (n != 2)
-      return -1;
+      int ready = poll(&pfd, 1, 1000); 
+      if (ready <= 0) return -1;        
 
-    return resp[0] + 256 * resp[1];
+      uint8_t resp[2] = {0, 0};
+      ssize_t n = read(fd_, resp, 2);
+      if (n != 2) return -1;
+
+      return resp[0] + 256 * resp[1];
   }
 };
 
